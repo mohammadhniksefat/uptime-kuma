@@ -117,6 +117,7 @@ const app = server.app;
 
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
+const Diagnostic = require("./model/diagnostic");
 const User = require("./model/user");
 
 log.debug("server", "Importing Settings");
@@ -789,6 +790,7 @@ let needSetup = false;
                 await R.store(bean);
 
                 await updateMonitorNotification(bean.id, notificationIDList);
+                await saveDiagnosticChain(socket.userID, bean.id, monitor.diagnosticChain);
 
                 await server.sendUpdateMonitorIntoList(socket, bean.id);
 
@@ -970,6 +972,7 @@ let needSetup = false;
                 }
 
                 await updateMonitorNotification(bean.id, monitor.notificationIDList);
+                await saveDiagnosticChain(socket.userID, bean.id, monitor.diagnosticChain);
 
                 if (await Monitor.isActive(bean.id, bean.active)) {
                     await restartMonitor(socket.userID, bean.id);
@@ -1017,9 +1020,66 @@ let needSetup = false;
                 let monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
                 const monitorData = [{ id: monitor.id, active: monitor.active }];
                 const preloadData = await Monitor.preparePreloadData(monitorData);
+
+                const monitorJSON = monitor.toJSON(preloadData);
+
+                // Attach diagnostic chain config + latest diagnostic results so the edit
+                // form and details page can display them.
+                const diagnosticChainConfig = await Diagnostic.getChainConfigForMonitor(monitor.id);
+                if (diagnosticChainConfig) {
+                    monitorJSON.diagnosticChain = diagnosticChainConfig;
+                }
+                monitorJSON.latestDiagnosticResults = (await Diagnostic.getLatestResultsForMonitor(monitor.id)) || [];
+
                 callback({
                     ok: true,
-                    monitor: monitor.toJSON(preloadData),
+                    monitor: monitorJSON,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("getDiagnosticResults", async (monitorID, callback) => {
+            try {
+                checkLogin(socket);
+
+                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found.");
+                }
+
+                const results = (await Diagnostic.getLatestResultsForMonitor(monitorID)) || [];
+                callback({
+                    ok: true,
+                    results,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("setDiagnosticChain", async (monitorID, diagnosticChain, callback) => {
+            try {
+                checkLogin(socket);
+
+                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found.");
+                }
+
+                await saveDiagnosticChain(socket.userID, monitorID, diagnosticChain);
+
+                callback({
+                    ok: true,
+                    msg: "Saved.",
+                    msgi18n: true,
                 });
             } catch (e) {
                 callback({
@@ -1782,6 +1842,32 @@ let needSetup = false;
     // Start cloudflared at the end if configured
     await cloudflaredAutoStart(cloudflaredToken);
 })();
+
+/**
+ * Validate and persist the diagnostic chain of a monitor.
+ * If diagnosticChain is not provided, the existing chain is left untouched.
+ * @param {number} userID ID of the user owning the monitor
+ * @param {number} monitorID ID of the primary monitor
+ * @param {{timeout?: number, items?: Array<{monitor_id: number}>}|undefined} diagnosticChain Chain payload from the frontend
+ * @returns {Promise<void>}
+ * @throws Error if any diagnostic monitor is invalid
+ */
+async function saveDiagnosticChain(userID, monitorID, diagnosticChain) {
+    if (!diagnosticChain) {
+        return;
+    }
+
+    const items = Array.isArray(diagnosticChain.items) ? diagnosticChain.items : [];
+    const parsedTimeout = Number.parseInt(diagnosticChain.timeout, 10);
+    const timeout = Number.isNaN(parsedTimeout) ? 0 : Math.max(0, parsedTimeout);
+
+    const validatedItems = await Diagnostic.validateDiagnosticItems(userID, items);
+    await Diagnostic.setChainForMonitor(
+        monitorID,
+        validatedItems.map((item) => ({ monitor_id: item.monitor_id })),
+        timeout
+    );
+}
 
 /**
  * Update notifications for a given monitor

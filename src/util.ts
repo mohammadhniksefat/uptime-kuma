@@ -43,6 +43,12 @@ export const SQL_DATE_FORMAT = "YYYY-MM-DD";
 export const SQL_DATETIME_FORMAT = "YYYY-MM-DD HH:mm:ss";
 export const SQL_DATETIME_FORMAT_WITHOUT_SECOND = "YYYY-MM-DD HH:mm";
 
+// Diagnostic run statuses
+export const DIAGNOSTIC_STATUS_RUNNING = 0;
+export const DIAGNOSTIC_STATUS_COMPLETED = 1;
+export const DIAGNOSTIC_STATUS_TIMED_OUT = 2;
+export const DIAGNOSTIC_STATUS_CANCELLED = 3;
+
 export const MIN_INTERVAL_SECOND = 1; // 1 second
 
 export const INCIDENT_PAGE_SIZE = 10;
