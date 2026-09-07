@@ -533,6 +533,27 @@ export default {
         },
 
         /**
+         * Get the latest diagnostic results of a monitor
+         * @param {number} monitorID ID of the primary monitor
+         * @param {socketCB} callback Callback for socket response
+         * @returns {void}
+         */
+        getDiagnosticResults(monitorID, callback) {
+            socket.emit("getDiagnosticResults", monitorID, callback);
+        },
+
+        /**
+         * Save the diagnostic chain of a monitor
+         * @param {number} monitorID ID of the primary monitor
+         * @param {{timeout?: number, items?: Array<{monitor_id: number}>}} diagnosticChain Chain to save
+         * @param {socketCB} callback Callback for socket response
+         * @returns {void}
+         */
+        setDiagnosticChain(monitorID, diagnosticChain, callback) {
+            socket.emit("setDiagnosticChain", monitorID, diagnosticChain, callback);
+        },
+
+        /**
          * Get list of maintenances
          * @param {socketCB} callback Callback for socket response
          * @returns {void}

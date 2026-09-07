@@ -480,3 +480,9 @@ exports.TYPES_WITH_DOMAIN_EXPIRY_SUPPORT_VIA_FIELD = {
     "tailscale-ping": "hostname",
     "sip-options": "hostname",
 };
+
+// Diagnostic run statuses
+exports.DIAGNOSTIC_STATUS_RUNNING = 0;
+exports.DIAGNOSTIC_STATUS_COMPLETED = 1;
+exports.DIAGNOSTIC_STATUS_TIMED_OUT = 2;
+exports.DIAGNOSTIC_STATUS_CANCELLED = 3;

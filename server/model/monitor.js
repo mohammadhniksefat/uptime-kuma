@@ -62,6 +62,7 @@ const zlib = require("node:zlib");
 const { promisify } = require("node:util");
 const brotliCompress = promisify(zlib.brotliCompress);
 const DomainExpiry = require("./domain_expiry");
+const Diagnostic = require("./diagnostic");
 
 const rootCertificates = rootCertificatesFingerprints();
 
@@ -960,10 +961,24 @@ class Monitor extends BeanModel {
             log.debug("monitor", `[${this.name}] Check isImportant`);
             let isImportant = Monitor.isImportantBeat(isFirstBeat, previousBeat?.status, bean.status);
 
+            let diagnosticResults = null;
+
             // Mark as important if status changed, ignore pending pings,
             // Don't notify if disrupted changes to up
             if (isImportant) {
                 bean.important = true;
+
+                // Run diagnostic chain on an important DOWN transition.
+                // This is intentionally gated by isImportant (eg UP -> DOWN) so that
+                // diagnostics run once per new failure, not on every repeated DOWN beat.
+                // Runs before sendNotification so the summary is included in the message.
+                if (bean.status === DOWN) {
+                    diagnosticResults = await runDiagnosticChain();
+                    if (diagnosticResults && diagnosticResults.results) {
+                        bean._diagnostics = diagnosticResults.results;
+                        bean._diagnosticsTimedOut = diagnosticResults.timedOut === true;
+                    }
+                }
 
                 if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
                     log.debug("monitor", `[${this.name}] sendNotification`);
@@ -1054,9 +1069,16 @@ class Monitor extends BeanModel {
             let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
             bean.end_time = R.isoDateTimeMillis(endTimeDayjs);
 
+            // Attach diagnostic results (if any) to the emitted heartbeat JSON so the
+            // frontend can display them alongside the primary failure.
+            let beatJSON = bean.toJSON();
+            if (diagnosticResults && diagnosticResults.results && diagnosticResults.results.length > 0) {
+                beatJSON.diagnostics = diagnosticResults.results;
+            }
+
             // Send to frontend
             log.debug("monitor", `[${this.name}] Send to socket`);
-            io.to(this.user_id).emit("heartbeat", bean.toJSON());
+            io.to(this.user_id).emit("heartbeat", beatJSON);
             Monitor.sendStats(io, this.id, this.user_id);
 
             // Store to database
@@ -1082,6 +1104,467 @@ class Monitor extends BeanModel {
             } else {
                 log.info("monitor", `[${this.name}] isStop = true, no next check.`);
             }
+        };
+
+        /**
+         * Run the diagnostic chain for this monitor when it has just entered a failed state.
+         * @returns {Promise<{run_id: number, timedOut: boolean, results: Array<object>}|null>} Run id, whether the run hit the chain timeout, and per-check results; null if no enabled chain
+         */
+        const runDiagnosticChain = async () => {
+            const chain = await Diagnostic.getChainForMonitor(this.id);
+            if (!chain || !chain.chain.enabled || chain.items.length === 0) {
+                return null;
+            }
+
+            const runID = await Diagnostic.createRun(chain.chain.id);
+            const startedAt = dayjs.utc();
+            const timeoutMs = chain.chain.timeout > 0 ? chain.chain.timeout * 1000 : 0;
+
+            const results = [];
+            let timedOut = false;
+
+            for (const item of chain.items) {
+                if (timedOut) {
+                    break;
+                }
+
+                const itemStartedAt = dayjs.utc();
+                let itemStatus = Diagnostic.DIAGNOSTIC_RESULT_STATUS.ERROR;
+                let itemPing = null;
+                let itemFinishedAt = itemStartedAt;
+                let diagnosticMonitor = null;
+
+                try {
+                    if (timeoutMs > 0 && startedAt.valueOf() + timeoutMs <= itemStartedAt.valueOf()) {
+                        timedOut = true;
+                        break;
+                    }
+
+                    diagnosticMonitor = await R.findOne("monitor", " id = ? ", [item.monitor_id]);
+                    if (!diagnosticMonitor) {
+                        itemStatus = Diagnostic.DIAGNOSTIC_RESULT_STATUS.ERROR;
+                        itemFinishedAt = dayjs.utc();
+                        await Diagnostic.addResult(runID, item.monitor_id, itemStatus, null);
+                        results.push({
+                            monitor_id: item.monitor_id,
+                            monitor_name: null,
+                            status: itemStatus,
+                            ping: itemPing,
+                            started_at: itemStartedAt.format(SQL_DATETIME_FORMAT),
+                            finished_at: itemFinishedAt.format(SQL_DATETIME_FORMAT),
+                        });
+                        continue;
+                    }
+
+                    if (diagnosticMonitor.user_id !== this.user_id) {
+                        continue;
+                    }
+
+                    const checkBean = await runDiagnosticCheck(diagnosticMonitor);
+                    itemStatus = checkBean.status;
+                    itemPing = checkBean.ping;
+                    itemFinishedAt = dayjs.utc();
+                } catch (error) {
+                    log.warn("diagnostic", `Diagnostic check failed for monitor #${item.monitor_id}: ${error && error.message || String(error)}`);
+                    itemStatus = Diagnostic.DIAGNOSTIC_RESULT_STATUS.ERROR;
+                    itemFinishedAt = dayjs.utc();
+                }
+
+                await Diagnostic.addResult(runID, item.monitor_id, itemStatus, itemPing);
+                results.push({
+                    monitor_id: item.monitor_id,
+                    monitor_name: diagnosticMonitor ? diagnosticMonitor.name : null,
+                    status: itemStatus,
+                    ping: itemPing,
+                    started_at: itemStartedAt.format(SQL_DATETIME_FORMAT),
+                    finished_at: itemFinishedAt.format(SQL_DATETIME_FORMAT),
+                });
+            }
+
+            const finalStatus = timedOut
+                ? Diagnostic.DIAGNOSTIC_STATUS_TIMED_OUT
+                : Diagnostic.DIAGNOSTIC_STATUS_COMPLETED;
+
+            await Diagnostic.finishRun(runID, finalStatus);
+
+            return {
+                run_id: runID,
+                timedOut,
+                results,
+            };
+        };
+
+        /**
+         * Run a single diagnostic check for a given monitor and return a minimal bean-like
+         * result with status/ping/msg.
+         * This intentionally does not start the monitor's own recurring loop.
+         * @param {Monitor} diagnosticMonitor The diagnostic monitor to check
+         * @returns {Promise<{status: number, ping: number|null, msg: string}>} Result of the single check
+         */
+        const runDiagnosticCheck = async (diagnosticMonitor) => {
+            const bean = R.dispense("heartbeat");
+            bean.monitor_id = diagnosticMonitor.id;
+            bean.time = R.isoDateTimeMillis(dayjs.utc());
+            bean.status = DOWN;
+            bean.msg = "";
+
+            const timeout = diagnosticMonitor.timeout && diagnosticMonitor.timeout > 0
+                ? diagnosticMonitor.timeout
+                : diagnosticMonitor.interval * 1000 * 0.8;
+
+            try {
+                if (await Monitor.isUnderMaintenance(diagnosticMonitor.id)) {
+                    bean.msg = "Monitor under maintenance";
+                    bean.status = MAINTENANCE;
+                } else if (diagnosticMonitor.type === "http" || diagnosticMonitor.type === "keyword" || diagnosticMonitor.type === "json-query") {
+                    let startTime = dayjs().valueOf();
+
+                    let basicAuthHeader = {};
+                    if (diagnosticMonitor.auth_method === "basic") {
+                        basicAuthHeader = {
+                            Authorization: "Basic " + encodeBase64(diagnosticMonitor.basic_auth_user, diagnosticMonitor.basic_auth_pass),
+                        };
+                    }
+
+                    let bearerAuthHeader = {};
+                    if (diagnosticMonitor.auth_method === "bearer") {
+                        bearerAuthHeader = {
+                            Authorization: "Bearer " + diagnosticMonitor.bearer_token,
+                        };
+                    }
+
+                    let oauth2AuthHeader = {};
+                    if (diagnosticMonitor.auth_method === "oauth2-cc") {
+                        try {
+                            if (
+                                diagnosticMonitor.oauthAccessToken === undefined ||
+                                new Date(diagnosticMonitor.oauthAccessToken.expires_at * 1000) <= new Date()
+                            ) {
+                                diagnosticMonitor.oauthAccessToken = await diagnosticMonitor.makeOidcTokenClientCredentialsRequest();
+                            }
+                            oauth2AuthHeader = {
+                                Authorization:
+                                    diagnosticMonitor.oauthAccessToken.token_type + " " + diagnosticMonitor.oauthAccessToken.access_token,
+                            };
+                        } catch (e) {
+                            throw new Error("The oauth config is invalid. " + e.message);
+                        }
+                    }
+
+                    let agentFamily = undefined;
+                    if (diagnosticMonitor.ipFamily === "ipv4") {
+                        agentFamily = 4;
+                    }
+                    if (diagnosticMonitor.ipFamily === "ipv6") {
+                        agentFamily = 6;
+                    }
+
+                    const httpsAgentOptions = {
+                        maxCachedSessions: 0,
+                        rejectUnauthorized: !diagnosticMonitor.getIgnoreTls(),
+                        secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
+                        autoSelectFamily: true,
+                        ...(agentFamily ? { family: agentFamily } : {}),
+                    };
+
+                    const httpAgentOptions = {
+                        maxCachedSessions: 0,
+                        autoSelectFamily: true,
+                        ...(agentFamily ? { family: agentFamily } : {}),
+                    };
+
+                    let contentType = null;
+                    let bodyValue = null;
+
+                    if (diagnosticMonitor.body && typeof diagnosticMonitor.body === "string" && diagnosticMonitor.body.trim().length > 0) {
+                        if (!diagnosticMonitor.httpBodyEncoding || diagnosticMonitor.httpBodyEncoding === "json") {
+                            try {
+                                bodyValue = JSON.parse(diagnosticMonitor.body);
+                                contentType = "application/json";
+                            } catch (e) {
+                                throw new Error("Your JSON body is invalid. " + e.message);
+                            }
+                        } else if (diagnosticMonitor.httpBodyEncoding === "form") {
+                            bodyValue = diagnosticMonitor.body;
+                            contentType = "application/x-www-form-urlencoded";
+                        } else if (diagnosticMonitor.httpBodyEncoding === "xml") {
+                            bodyValue = diagnosticMonitor.body;
+                            contentType = "text/xml; charset=utf-8";
+                        }
+                    }
+
+                    const options = {
+                        url: diagnosticMonitor.url,
+                        method: (diagnosticMonitor.method || "get").toLowerCase(),
+                        timeout: timeout * 1000,
+                        headers: {
+                            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+                            ...(contentType ? { "Content-Type": contentType } : {}),
+                            ...basicAuthHeader,
+                            ...bearerAuthHeader,
+                            ...oauth2AuthHeader,
+                            ...(diagnosticMonitor.headers ? JSON.parse(diagnosticMonitor.headers) : {}),
+                        },
+                        maxRedirects: diagnosticMonitor.maxredirects,
+                        validateStatus: (status) => {
+                            return checkStatusCode(status, diagnosticMonitor.getAcceptedStatuscodes());
+                        },
+                        signal: axiosAbortSignal((timeout + 10) * 1000),
+                    };
+
+                    if (bodyValue) {
+                        options.data = bodyValue;
+                    }
+
+                    if (diagnosticMonitor.cacheBust) {
+                        const randomFloatString = Math.random().toString(36);
+                        const cacheBust = randomFloatString.substring(2);
+                        options.params = {
+                            uptime_kuma_cachebuster: cacheBust,
+                        };
+                    }
+
+                    if (diagnosticMonitor.proxy_id) {
+                        const proxy = await R.load("proxy", diagnosticMonitor.proxy_id);
+
+                        if (proxy && proxy.active) {
+                            const { httpAgent, httpsAgent } = Proxy.createAgents(proxy, {
+                                httpsAgentOptions,
+                                httpAgentOptions,
+                            });
+
+                            options.proxy = false;
+                            options.httpAgent = httpAgent;
+                            options.httpsAgent = httpsAgent;
+                        }
+                    }
+
+                    if (!options.httpAgent) {
+                        options.httpAgent = new http.Agent(httpAgentOptions);
+                    }
+
+                    if (!options.httpsAgent) {
+                        let jar = new CookieJar();
+                        let httpsCookieAgentOptions = {
+                            ...httpsAgentOptions,
+                            cookies: { jar },
+                        };
+                        options.httpsAgent = new HttpsCookieAgent(httpsCookieAgentOptions);
+                    }
+
+                    if (diagnosticMonitor.auth_method === "mtls") {
+                        if (diagnosticMonitor.tlsCert !== null && diagnosticMonitor.tlsCert !== "") {
+                            options.httpsAgent.options.cert = Buffer.from(diagnosticMonitor.tlsCert);
+                        }
+                        if (diagnosticMonitor.tlsCa !== null && diagnosticMonitor.tlsCa !== "") {
+                            options.httpsAgent.options.ca = Buffer.from(diagnosticMonitor.tlsCa);
+                        }
+                        if (diagnosticMonitor.tlsKey !== null && diagnosticMonitor.tlsKey !== "") {
+                            options.httpsAgent.options.key = Buffer.from(diagnosticMonitor.tlsKey);
+                        }
+                    }
+
+                    let res = await diagnosticMonitor.makeAxiosRequest(options);
+
+                    bean.msg = `${res.status} - ${res.statusText}`;
+                    bean.ping = dayjs().valueOf() - startTime;
+
+                    if (diagnosticMonitor.type === "http") {
+                        bean.status = UP;
+                    } else if (diagnosticMonitor.type === "keyword") {
+                        let data = res.data;
+
+                        if (typeof data !== "string") {
+                            data = JSON.stringify(data);
+                        }
+
+                        let keywordFound = data.includes(diagnosticMonitor.keyword);
+                        if (keywordFound === !diagnosticMonitor.isInvertKeyword()) {
+                            bean.msg += ", keyword " + (keywordFound ? "is" : "not") + " found";
+                            bean.status = UP;
+                        } else {
+                            data = data.replace(/<[^>]*>?|[\n\r]|\s+/gm, " ").trim();
+                            if (data.length > 50) {
+                                data = data.substring(0, 47) + "...";
+                            }
+                            throw new Error(
+                                bean.msg +
+                                    ", but keyword is " +
+                                    (keywordFound ? "present" : "not") +
+                                    " in [" +
+                                    data +
+                                    "]"
+                            );
+                        }
+                    } else if (diagnosticMonitor.type === "json-query") {
+                        let data = res.data;
+
+                        const { status, response } = await evaluateJsonQuery(
+                            data,
+                            diagnosticMonitor.jsonPath,
+                            diagnosticMonitor.jsonPathOperator,
+                            diagnosticMonitor.expectedValue
+                        );
+
+                        if (status) {
+                            bean.status = UP;
+                            bean.msg = `JSON query passes (comparing ${response} ${diagnosticMonitor.jsonPathOperator} ${diagnosticMonitor.expectedValue})`;
+                        } else {
+                            throw new Error(
+                                `JSON query does not pass (comparing ${response} ${diagnosticMonitor.jsonPathOperator} ${diagnosticMonitor.expectedValue})`
+                            );
+                        }
+                    }
+                } else if (diagnosticMonitor.type === "ping") {
+                    bean.ping = await ping(
+                        diagnosticMonitor.hostname,
+                        diagnosticMonitor.ping_count,
+                        "",
+                        diagnosticMonitor.ping_numeric,
+                        diagnosticMonitor.packetSize,
+                        diagnosticMonitor.timeout,
+                        diagnosticMonitor.ping_per_request_timeout
+                    );
+                    bean.msg = "";
+                    bean.status = UP;
+                    } else if (diagnosticMonitor.type === "push") {
+                    throw new Error("Push monitor type is not supported as a diagnostic check.");
+                } else if (diagnosticMonitor.type === "docker") {
+                    const options = {
+                        url: `/containers/${diagnosticMonitor.docker_container}/json`,
+                        timeout: diagnosticMonitor.interval * 1000 * 0.8,
+                        headers: {
+                            Accept: "*/*",
+                        },
+                        httpsAgent: new https.Agent({
+                            maxCachedSessions: 0,
+                            rejectUnauthorized: !diagnosticMonitor.getIgnoreTls(),
+                            secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT,
+                        }),
+                        httpAgent: new http.Agent({
+                            maxCachedSessions: 0,
+                        }),
+                    };
+
+                    const dockerHost = await R.load("docker_host", diagnosticMonitor.docker_host);
+
+                    if (!dockerHost) {
+                        throw new Error("Failed to load docker host config");
+                    }
+
+                    if (dockerHost._dockerType === "socket") {
+                        options.socketPath = dockerHost._dockerDaemon;
+                    } else if (dockerHost._dockerType === "tcp") {
+                        options.baseURL = DockerHost.patchDockerURL(dockerHost._dockerDaemon);
+                        options.httpsAgent = new https.Agent(
+                            await DockerHost.getHttpsAgentOptions(dockerHost._dockerType, options.baseURL)
+                        );
+                    }
+
+                    let res = await axios.request(options);
+
+                    if (!res.data.State) {
+                        throw Error("Container state is not available");
+                    }
+                    if (!res.data.State.Running) {
+                        throw Error("Container State is " + res.data.State.Status);
+                    }
+                    if (res.data.State.Paused) {
+                        throw Error("Container is in a paused state");
+                    }
+                    if (res.data.State.Restarting) {
+                        bean.status = PENDING;
+                        bean.msg = "Container is reporting it is currently restarting";
+                    } else if (res.data.State.Health && res.data.State.Health.Status !== "none") {
+                        if (res.data.State.Health.Status === "healthy") {
+                            bean.status = UP;
+                            bean.msg = "healthy";
+                        } else if (res.data.State.Health.Status === "unhealthy") {
+                            throw Error("Container State is unhealthy according to its healthcheck");
+                        } else {
+                            bean.status = PENDING;
+                            bean.msg = res.data.State.Health.Status;
+                        }
+                    } else {
+                        bean.status = UP;
+                        bean.msg = `Container has not reported health and is currently ${res.data.State.Status}. As it is running, it is considered UP. Consider adding a health check for better service visibility`;
+                    }
+                } else if (diagnosticMonitor.type === "radius") {
+                    let startTime = dayjs().valueOf();
+
+                    let port;
+                    if (diagnosticMonitor.port == null) {
+                        port = 1812;
+                    } else {
+                        port = diagnosticMonitor.port;
+                    }
+
+                    const resp = await radius(
+                        diagnosticMonitor.hostname,
+                        diagnosticMonitor.radiusUsername,
+                        diagnosticMonitor.radiusPassword,
+                        diagnosticMonitor.radiusCalledStationId,
+                        diagnosticMonitor.radiusCallingStationId,
+                        diagnosticMonitor.radiusSecret,
+                        port,
+                        diagnosticMonitor.interval * 1000 * 0.4
+                    );
+
+                    bean.msg = resp.code;
+                    bean.status = UP;
+                    bean.ping = dayjs().valueOf() - startTime;
+                } else if (diagnosticMonitor.type in UptimeKumaServer.monitorTypeList) {
+                    let startTime = dayjs().valueOf();
+                    const monitorType = UptimeKumaServer.monitorTypeList[diagnosticMonitor.type];
+                    await monitorType.check(diagnosticMonitor, bean, UptimeKumaServer.getInstance());
+
+                    if (!monitorType.allowCustomStatus && bean.status !== UP) {
+                        throw new Error(
+                            "The monitor implementation is incorrect, non-UP error must throw error inside check()"
+                        );
+                    }
+
+                    if (bean.ping === undefined || bean.ping === null) {
+                        bean.ping = dayjs().valueOf() - startTime;
+                    }
+                } else if (diagnosticMonitor.type === "kafka-producer") {
+                    let startTime = dayjs().valueOf();
+
+                    bean.msg = await kafkaProducerAsync(
+                        JSON.parse(diagnosticMonitor.kafkaProducerBrokers),
+                        diagnosticMonitor.kafkaProducerTopic,
+                        diagnosticMonitor.kafkaProducerMessage,
+                        {
+                            allowAutoTopicCreation: diagnosticMonitor.kafkaProducerAllowAutoTopicCreation,
+                            ssl: diagnosticMonitor.kafkaProducerSsl,
+                            clientId: `Uptime-Kuma/${version}`,
+                            interval: diagnosticMonitor.interval,
+                            connectionTimeout: diagnosticMonitor.timeout,
+                        },
+                        JSON.parse(diagnosticMonitor.kafkaProducerSaslOptions)
+                    );
+                    bean.status = UP;
+                    bean.ping = dayjs().valueOf() - startTime;
+                } else {
+                    throw new Error("Unknown Monitor Type");
+                }
+            } catch (error) {
+                if (error?.name === "CanceledError") {
+                    bean.msg = `timeout by AbortSignal (${timeout}s)`;
+                } else {
+                    bean.msg = error.message;
+                }
+
+                if (diagnosticMonitor.getSaveErrorResponse() && error?.response?.data !== undefined) {
+                    await diagnosticMonitor.saveResponseData(bean, error.response.data);
+                }
+            }
+
+            return {
+                status: bean.status,
+                ping: bean.ping,
+                msg: bean.msg,
+            };
         };
 
         /**
@@ -1477,6 +1960,50 @@ class Monitor extends BeanModel {
                 .utc(heartbeatJSON["time"])
                 .tz(heartbeatJSON["timezone"])
                 .format(SQL_DATETIME_FORMAT);
+
+            // Attach diagnostic results to the heartbeat JSON and append a human-readable
+            // summary to the notification message so recipients can see what the checks found.
+            let diagnostics = bean._diagnostics || null;
+            if (!diagnostics && bean.status === DOWN) {
+                try {
+                    const latestResults = await Diagnostic.getLatestResultsForMonitor(monitor.id);
+                    if (latestResults && latestResults.length > 0) {
+                        diagnostics = latestResults;
+                    }
+                } catch (e) {
+                    log.debug("monitor", `[${monitor.name}] Could not load diagnostic results: ${e.message}`);
+                }
+            }
+
+            if (diagnostics && diagnostics.length > 0) {
+                heartbeatJSON["diagnostics"] = diagnostics.map((r) => ({
+                    monitorID: r.monitor_id,
+                    monitorName: r.monitor_name || ("Monitor #" + r.monitor_id),
+                    status: r.status,
+                    ping: r.ping,
+                    startedAt: r.started_at,
+                    finishedAt: r.finished_at,
+                }));
+
+                const summaryLines = ["", "Diagnostics:"];
+                for (const d of heartbeatJSON["diagnostics"]) {
+                    const icon = d.status === Diagnostic.DIAGNOSTIC_RESULT_STATUS.UP ? "\u2713" : "\u2717";
+                    summaryLines.push(`${icon} ${d.monitorName}`);
+                }
+
+                const failedDiagnostics = heartbeatJSON["diagnostics"].filter(
+                    (d) => d.status !== Diagnostic.DIAGNOSTIC_RESULT_STATUS.UP
+                );
+                if (bean._diagnosticsTimedOut) {
+                    summaryLines.push("Diagnostics timed out before completion.");
+                } else if (failedDiagnostics.length > 0) {
+                    summaryLines.push(`Diagnostic conclusion: ${failedDiagnostics[0].monitorName} failed.`);
+                } else {
+                    summaryLines.push("Diagnostic conclusion: All diagnostic checks passed.");
+                }
+
+                msg += summaryLines.join("\n");
+            }
 
             // Calculate downtime tracking information when service comes back up
             // This makes downtime information available to all notification providers
@@ -1992,6 +2519,14 @@ class Monitor extends BeanModel {
         if (monitorID in server.monitorList) {
             await server.monitorList[monitorID].stop();
             delete server.monitorList[monitorID];
+        }
+
+        // Delete the diagnostic chain (if any) of this monitor, including its runs
+        // and results, so diagnostics do not outlive their primary monitor.
+        try {
+            await Diagnostic.deleteChainForMonitor(monitorID);
+        } catch (e) {
+            log.debug("monitor", `Could not delete diagnostic chain for monitor #${monitorID}: ${e.message}`);
         }
 
         // Delete from database

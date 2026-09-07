@@ -2199,6 +2199,89 @@
                         <div class="col-md-6">
                             <div v-if="$root.isMobile" class="mt-3" />
 
+                            <!-- Failure Diagnostics -->
+                            <template v-if="isEdit || isClone">
+                                <h2 class="mt-5 mb-2">{{ $t("Diagnostics") }}</h2>
+                                <p class="form-text">
+                                    {{ $t("diagnosticChainDescription") }}
+                                </p>
+
+                                <div class="my-3">
+                                    <label for="diagnosticMonitorSelector" class="form-label">{{
+                                        $t("Add diagnostic check")
+                                    }}</label>
+                                    <VueMultiselect
+                                        id="diagnosticMonitorSelector"
+                                        v-model="selectedDiagnosticCandidate"
+                                        :options="diagnosticCandidates"
+                                        :multiple="false"
+                                        :close-on-select="true"
+                                        :clear-on-select="true"
+                                        :placeholder="$t('Add diagnostic check')"
+                                        label="name"
+                                        track-by="id"
+                                        :show-labels="false"
+                                        @select="addDiagnostic"
+                                    />
+                                </div>
+
+                                <ol
+                                    v-if="diagnosticItems.length > 0"
+                                    class="list-group list-group-numbered my-3"
+                                >
+                                    <li
+                                        v-for="(item, index) in diagnosticItems"
+                                        :key="item.monitor_id"
+                                        class="list-group-item d-flex justify-content-between align-items-center"
+                                    >
+                                        <span>{{ item.name }}</span>
+                                        <span>
+                                            <button
+                                                type="button"
+                                                class="btn btn-sm btn-outline-secondary me-1"
+                                                :disabled="index === 0"
+                                                :aria-label="$t('Move Up')"
+                                                @click="moveDiagnostic(index, -1)"
+                                            >
+                                                ▲
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="btn btn-sm btn-outline-secondary me-1"
+                                                :disabled="index === diagnosticItems.length - 1"
+                                                :aria-label="$t('Move Down')"
+                                                @click="moveDiagnostic(index, 1)"
+                                            >
+                                                ▼
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="btn btn-sm btn-outline-danger"
+                                                :aria-label="$t('Delete')"
+                                                @click="removeDiagnostic(index)"
+                                            >
+                                                ✕
+                                            </button>
+                                        </span>
+                                    </li>
+                                </ol>
+                                <p v-else class="form-text">{{ $t("noDiagnosticChecks") }}</p>
+
+                                <div class="my-3">
+                                    <label for="diagnosticTimeout" class="form-label">{{
+                                        $t("Diagnostic timeout (seconds)")
+                                    }}</label>
+                                    <input
+                                        id="diagnosticTimeout"
+                                        v-model.number="monitor.diagnosticChain.timeout"
+                                        type="number"
+                                        min="0"
+                                        class="form-control"
+                                    />
+                                    <div class="form-text">{{ $t("diagnosticTimeoutDescription") }}</div>
+                                </div>
+                            </template>
+
                             <!-- Notifications -->
                             <h2 class="mb-2">{{ $t("Notifications") }}</h2>
                             <p v-if="$root.notificationList.length === 0">
@@ -3385,6 +3468,7 @@ export default {
             pm2ProcessOptions: [],
             pm2ProcessLoading: false,
             pm2ProcessError: "",
+            selectedDiagnosticCandidate: null,
         };
     },
 
@@ -3462,6 +3546,36 @@ export default {
                     this.monitor.remote_browser = null;
                 }
             },
+        },
+
+        /**
+         * Selected diagnostic checks in configured order
+         * @returns {Array<{monitor_id: number, name: string}>} Diagnostic items
+         */
+        diagnosticItems() {
+            return this.monitor.diagnosticChain?.items || [];
+        },
+
+        /**
+         * Monitors that can be selected as diagnostic checks for this monitor
+         * (same user, active, non-group, not itself, not already selected)
+         * @returns {Array<{id: number, name: string}>} Candidate monitors
+         */
+        diagnosticCandidates() {
+            const selectedIDs = this.diagnosticItems.map((item) => item.monitor_id);
+            return Object.values(this.$root.monitorList)
+                .filter(
+                    (monitor) =>
+                        monitor.type !== "group" &&
+                        monitor.id !== this.monitor.id &&
+                        monitor.active !== 0 &&
+                        !selectedIDs.includes(monitor.id)
+                )
+                .sort((m1, m2) => (m1.pathName || m1.name || "").localeCompare(m2.pathName || m2.name || ""))
+                .map((monitor) => ({
+                    id: monitor.id,
+                    name: monitor.pathName || monitor.name,
+                }));
         },
 
         isAdd() {
@@ -4024,6 +4138,10 @@ message HealthCheckResponse {
             if (this.isAdd) {
                 this.monitor = {
                     ...monitorDefaults,
+                    diagnosticChain: {
+                        timeout: 0,
+                        items: [],
+                    },
                     ping_count: 3,
                     ping_numeric: true,
                     packetSize: 56,
@@ -4054,6 +4172,13 @@ message HealthCheckResponse {
                         }
 
                         this.monitor = res.monitor;
+
+                        if (!this.monitor.diagnosticChain) {
+                            this.monitor.diagnosticChain = {
+                                timeout: 0,
+                                items: [],
+                            };
+                        }
 
                         if (this.isClone) {
                             /*
@@ -4422,6 +4547,56 @@ message HealthCheckResponse {
          * @param {number} id ID of notification to add
          * @returns {void}
          */
+        /**
+         * Add a monitor to the diagnostic chain
+         * @param {object} candidate Selected candidate monitor
+         * @returns {void}
+         */
+        addDiagnostic(candidate) {
+            if (!candidate || !this.monitor.diagnosticChain) {
+                return;
+            }
+            if (this.monitor.diagnosticChain.items.some((item) => item.monitor_id === candidate.id)) {
+                return;
+            }
+            this.monitor.diagnosticChain.items.push({
+                monitor_id: candidate.id,
+                name: candidate.name,
+            });
+            this.selectedDiagnosticCandidate = null;
+        },
+
+        /**
+         * Remove a diagnostic check from the chain
+         * @param {number} index Index of the item to remove
+         * @returns {void}
+         */
+        removeDiagnostic(index) {
+            if (!this.monitor.diagnosticChain) {
+                return;
+            }
+            this.monitor.diagnosticChain.items.splice(index, 1);
+        },
+
+        /**
+         * Move a diagnostic check up or down in the chain
+         * @param {number} index Index of the item to move
+         * @param {number} direction -1 to move up, 1 to move down
+         * @returns {void}
+         */
+        moveDiagnostic(index, direction) {
+            if (!this.monitor.diagnosticChain) {
+                return;
+            }
+            const items = this.monitor.diagnosticChain.items;
+            const target = index + direction;
+            if (target < 0 || target >= items.length) {
+                return;
+            }
+            const [item] = items.splice(index, 1);
+            items.splice(target, 0, item);
+        },
+
         addedNotification(id) {
             this.monitor.notificationIDList[id] = true;
         },

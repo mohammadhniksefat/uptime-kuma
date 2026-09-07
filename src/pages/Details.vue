@@ -168,6 +168,40 @@
                 </div>
             </div>
 
+            <!-- Failure Diagnostics -->
+            <div v-if="diagnosticDisplayResults.length > 0" class="shadow-box big-padding mb-3">
+                <h4 class="mb-3">{{ $t("Diagnostics") }}</h4>
+                <table class="table table-borderless mb-0">
+                    <thead>
+                        <tr>
+                            <th>{{ $t("Monitor") }}</th>
+                            <th>{{ $t("Status") }}</th>
+                            <th>{{ $t("Ping") }}</th>
+                            <th>{{ $t("DateTime") }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="result in diagnosticDisplayResults" :key="result.monitor_id">
+                            <td>
+                                <router-link
+                                    v-if="result.monitor_id !== monitor.id"
+                                    :to="monitorURL(result.monitor_id)"
+                                >{{ result.monitor_name || "#" + result.monitor_id }}</router-link>
+                                <span v-else>{{ result.monitor_name || "#" + result.monitor_id }}</span>
+                            </td>
+                            <td>
+                                <span class="badge" :class="diagnosticStatusClass(result.status)">
+                                    {{ diagnosticStatusText(result.status) }}
+                                </span>
+                            </td>
+                            <td>{{ result.ping != null ? result.ping + " ms" : "-" }}</td>
+                            <td><Datetime :value="result.finished_at" /></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p v-if="diagnosticConclusion" class="mb-0 mt-2">{{ diagnosticConclusion }}</p>
+            </div>
+
             <!-- Push Examples -->
             <div v-if="monitor.type === 'push'" class="shadow-box big-padding">
                 <a href="#" @click="pushMonitor.showPushExamples = !pushMonitor.showPushExamples">
@@ -450,7 +484,7 @@ import Pagination from "v-pagination-3";
 const PingChart = defineAsyncComponent(() => import("../components/PingChart.vue"));
 import Tag from "../components/Tag.vue";
 import CertificateInfo from "../components/CertificateInfo.vue";
-import { getMonitorRelativeURL } from "../util.ts";
+import { DOWN, getMonitorRelativeURL } from "../util.ts";
 import { URL } from "whatwg-url";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
@@ -498,6 +532,7 @@ export default {
                 code: "",
             },
             deleteChildrenMonitors: false,
+            diagnosticResults: [],
         };
     },
     computed: {
@@ -602,11 +637,62 @@ export default {
                 return "";
             }
         },
+
+        /**
+         * Diagnostic results attached to the most recent DOWN heartbeat (if any).
+         * @returns {Array<object>|null} Diagnostics from the live heartbeat
+         */
+        lastBeatDiagnostics() {
+            if (!this.monitor) {
+                return null;
+            }
+            const lastBeat = this.$root.lastHeartbeatList[this.monitor.id];
+            if (lastBeat && lastBeat.status === DOWN && Array.isArray(lastBeat.diagnostics)) {
+                return lastBeat.diagnostics;
+            }
+            return null;
+        },
+
+        /**
+         * Diagnostic results to display: live heartbeat diagnostics when
+         * available, otherwise the latest stored run for this monitor.
+         * @returns {Array<object>} Diagnostic results
+         */
+        diagnosticDisplayResults() {
+            if (this.lastBeatDiagnostics) {
+                return this.lastBeatDiagnostics;
+            }
+            return this.diagnosticResults || [];
+        },
+
+        /**
+         * Short conclusion of the displayed diagnostic results.
+         * @returns {string} Conclusion text or empty string
+         */
+        diagnosticConclusion() {
+            const results = this.diagnosticDisplayResults;
+            if (!results || results.length === 0) {
+                return "";
+            }
+            const failed = results.filter((r) => r.status !== DOWN);
+            if (failed.length > 0) {
+                return this.$t("diagnosticConclusionFailed", [
+                    failed[0].monitor_name || "#" + failed[0].monitor_id,
+                ]);
+            }
+            return this.$t("diagnosticConclusionAllPassed");
+        },
     },
 
     watch: {
         page(to) {
             this.getImportantHeartbeatListPaged();
+        },
+
+        "monitor.id"(to) {
+            if (to) {
+                this.loadDiagnostics();
+            }
         },
 
         monitor(to) {
@@ -774,6 +860,59 @@ export default {
          */
         monitorURL(id) {
             return getMonitorRelativeURL(id);
+        },
+
+        /**
+         * Load the latest stored diagnostic results for this monitor
+         * @returns {void}
+         */
+        loadDiagnostics() {
+            if (this.monitor && this.monitor.id) {
+                this.$root.getDiagnosticResults(this.monitor.id, (res) => {
+                    if (res.ok) {
+                        this.diagnosticResults = res.results || [];
+                    }
+                });
+            }
+        },
+
+        /**
+         * Text label of a diagnostic result status
+         * @param {number} status Diagnostic result status (0=UP, 1=DOWN, 2=ERROR, 3=TIMEOUT)
+         * @returns {string} Status text
+         */
+        diagnosticStatusText(status) {
+            switch (status) {
+                case 0:
+                    return "UP";
+                case 1:
+                    return "DOWN";
+                case 2:
+                    return "ERROR";
+                case 3:
+                    return "TIMEOUT";
+                default:
+                    return "UNKNOWN";
+            }
+        },
+
+        /**
+         * CSS class of a diagnostic result status badge
+         * @param {number} status Diagnostic result status (0=UP, 1=DOWN, 2=ERROR, 3=TIMEOUT)
+         * @returns {string} CSS class
+         */
+        diagnosticStatusClass(status) {
+            switch (status) {
+                case 0:
+                    return "bg-success";
+                case 1:
+                    return "bg-danger";
+                case 2:
+                case 3:
+                    return "bg-warning";
+                default:
+                    return "bg-secondary";
+            }
         },
 
         /**
