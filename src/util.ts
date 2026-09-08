@@ -49,6 +49,47 @@ export const DIAGNOSTIC_STATUS_COMPLETED = 1;
 export const DIAGNOSTIC_STATUS_TIMED_OUT = 2;
 export const DIAGNOSTIC_STATUS_CANCELLED = 3;
 
+// HTTP workflow run statuses
+export const WORKFLOW_STATUS_RUNNING = 0;
+export const WORKFLOW_STATUS_SUCCESS = 1;
+export const WORKFLOW_STATUS_FAILED = 2;
+export const WORKFLOW_STATUS_TIMED_OUT = 3;
+
+// HTTP workflow step result statuses
+export const WORKFLOW_STEP_STATUS_SUCCESS = 0;
+export const WORKFLOW_STEP_STATUS_FAILED = 1;
+export const WORKFLOW_STEP_STATUS_SKIPPED = 2;
+
+// HTTP methods supported by workflow steps
+export const HTTP_WORKFLOW_METHODS = [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+] as const;
+
+// Assertion types supported by workflow steps
+export const HTTP_WORKFLOW_ASSERTION_TYPES = [
+    "status",
+    "bodyContains",
+    "jsonEquals",
+    "jsonExists",
+    "responseTime",
+] as const;
+
+// Operators supported by the status assertion
+export const HTTP_WORKFLOW_STATUS_OPERATORS = ["==", "!="] as const;
+
+// Operators supported by the response time assertion
+export const HTTP_WORKFLOW_TIME_OPERATORS = ["<", "<=", ">", ">="] as const;
+
+/**
+ * Default limit for the number of stored workflow runs per workflow.
+ * Older runs are pruned when this limit is exceeded.
+ */
+export const HTTP_WORKFLOW_MAX_RUNS = 50;
+
 export const MIN_INTERVAL_SECOND = 1; // 1 second
 
 export const INCIDENT_PAGE_SIZE = 10;

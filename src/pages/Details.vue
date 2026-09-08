@@ -202,6 +202,52 @@
                 <p v-if="diagnosticConclusion" class="mb-0 mt-2">{{ diagnosticConclusion }}</p>
             </div>
 
+            <!-- HTTP Workflow Results -->
+            <div
+                v-if="monitor.type === 'http-workflow' && workflowRun"
+                class="shadow-box big-padding mb-3"
+            >
+                <h4 class="mb-3">{{ $t("HTTP Workflow") }}</h4>
+                <p class="mb-2">
+                    <span class="badge" :class="workflowRunStatusClass(workflowRun.status)">
+                        {{ workflowRunStatusText(workflowRun.status) }}
+                    </span>
+                    <span v-if="workflowRun.duration != null" class="ms-2">
+                        {{ $t("Total: {0}ms", [ workflowRun.duration ]) }}
+                    </span>
+                    <span v-if="workflowRun.finished_at" class="ms-2">
+                        <Datetime :value="workflowRun.finished_at" />
+                    </span>
+                </p>
+                <table class="table table-borderless mb-0">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>{{ $t("Step") }}</th>
+                            <th>{{ $t("Status") }}</th>
+                            <th>{{ $t("Ping") }}</th>
+                            <th>{{ $t("Error") }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="step in workflowRun.steps" :key="step.order">
+                            <td>{{ step.order }}</td>
+                            <td>
+                                {{ step.name || $t("Step") }}
+                                <div class="small text-muted">{{ step.method }} {{ step.url }}</div>
+                            </td>
+                            <td>
+                                <span class="badge" :class="workflowStepStatusClass(step.status)">
+                                    {{ workflowStepStatusText(step.status) }}
+                                </span>
+                            </td>
+                            <td>{{ step.duration != null ? step.duration + " ms" : "-" }}</td>
+                            <td class="text-break">{{ step.error || "-" }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
             <!-- Push Examples -->
             <div v-if="monitor.type === 'push'" class="shadow-box big-padding">
                 <a href="#" @click="pushMonitor.showPushExamples = !pushMonitor.showPushExamples">
@@ -533,6 +579,7 @@ export default {
             },
             deleteChildrenMonitors: false,
             diagnosticResults: [],
+            workflowRun: null,
         };
     },
     computed: {
@@ -692,6 +739,7 @@ export default {
         "monitor.id"(to) {
             if (to) {
                 this.loadDiagnostics();
+                this.loadWorkflowRun();
             }
         },
 
@@ -877,6 +925,92 @@ export default {
         },
 
         /**
+         * Load the latest HTTP workflow run for this monitor
+         * @returns {void}
+         */
+        loadWorkflowRun() {
+            if (this.monitor && this.monitor.id && this.monitor.type === "http-workflow") {
+                this.$root.getWorkflowRuns(this.monitor.id, (res) => {
+                    if (res.ok) {
+                        this.workflowRun = res.run || null;
+                    }
+                });
+            }
+        },
+
+        /**
+         * Text label of a workflow run status
+         * @param {number} status Workflow run status (1=success, 2=failed, 3=timed out)
+         * @returns {string} Status text
+         */
+        workflowRunStatusText(status) {
+            switch (status) {
+                case 1:
+                    return this.$t("Workflow Success");
+                case 2:
+                    return this.$t("Workflow Failed");
+                case 3:
+                    return this.$t("Workflow Timed Out");
+                default:
+                    return "UNKNOWN";
+            }
+        },
+
+        /**
+         * CSS class of a workflow run status badge
+         * @param {number} status Workflow run status
+         * @returns {string} CSS class
+         */
+        workflowRunStatusClass(status) {
+            switch (status) {
+                case 1:
+                    return "bg-success";
+                case 3:
+                    return "bg-warning";
+                case 2:
+                    return "bg-danger";
+                default:
+                    return "bg-secondary";
+            }
+        },
+
+        /**
+         * Text label of a workflow step result status
+         * @param {number} status Step result status (0=success, 1=failed, 2=skipped)
+         * @returns {string} Status text
+         */
+        workflowStepStatusText(status) {
+            switch (status) {
+                case 0:
+                    return this.$t("Success");
+                case 1:
+                    return this.$t("Failed");
+                case 2:
+                    return this.$t("Skipped");
+                default:
+                    return "UNKNOWN";
+            }
+        },
+
+        /**
+         * CSS class of a workflow step result status badge
+         * @param {number} status Step result status
+         * @returns {string} CSS class
+         */
+        workflowStepStatusClass(status) {
+            switch (status) {
+                case 0:
+                    return "bg-success";
+                case 1:
+                    return "bg-danger";
+                case 2:
+                    return "bg-secondary";
+                default:
+                    return "bg-secondary";
+            }
+        },
+
+        /**
          * Text label of a diagnostic result status
          * @param {number} status Diagnostic result status (0=UP, 1=DOWN, 2=ERROR, 3=TIMEOUT)
          * @returns {string} Status text
@@ -978,6 +1112,11 @@ export default {
                         this.displayedRecords.pop();
                     }
                     this.importantHeartBeatListLength += 1;
+                }
+
+                // Refresh the latest workflow run for workflow monitors.
+                if (this.monitor.type === "http-workflow") {
+                    this.loadWorkflowRun();
                 }
             }
         },

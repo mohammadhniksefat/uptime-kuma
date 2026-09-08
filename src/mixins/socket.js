@@ -554,6 +554,27 @@ export default {
         },
 
         /**
+         * Get the latest HTTP workflow run of a monitor
+         * @param {number} monitorID ID of the workflow monitor
+         * @param {socketCB} callback Callback for socket response
+         * @returns {void}
+         */
+        getWorkflowRuns(monitorID, callback) {
+            socket.emit("getWorkflowRuns", monitorID, callback);
+        },
+
+        /**
+         * Save the HTTP workflow of a monitor
+         * @param {number} monitorID ID of the workflow monitor
+         * @param {{enabled?: boolean, timeout?: number, steps?: Array<object>}} httpWorkflow Workflow to save
+         * @param {socketCB} callback Callback for socket response
+         * @returns {void}
+         */
+        setHttpWorkflow(monitorID, httpWorkflow, callback) {
+            socket.emit("setHttpWorkflow", monitorID, httpWorkflow, callback);
+        },
+
+        /**
          * Get list of maintenances
          * @param {socketCB} callback Callback for socket response
          * @returns {void}
