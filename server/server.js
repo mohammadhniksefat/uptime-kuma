@@ -118,6 +118,7 @@ const app = server.app;
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 const Diagnostic = require("./model/diagnostic");
+const HttpWorkflow = require("./model/http-workflow");
 const User = require("./model/user");
 
 log.debug("server", "Importing Settings");
@@ -749,6 +750,14 @@ let needSetup = false;
                 let notificationIDList = monitor.notificationIDList;
                 delete monitor.notificationIDList;
 
+                // Frontend-only config objects that are persisted through dedicated
+                // helpers after the monitor bean is stored. They must not be imported
+                // into the bean (redbean would try to insert them as columns).
+                const diagnosticChain = monitor.diagnosticChain;
+                const httpWorkflow = monitor.httpWorkflow;
+                delete monitor.diagnosticChain;
+                delete monitor.httpWorkflow;
+
                 // Ensure status code ranges are strings
                 if (!monitor.accepted_statuscodes.every((code) => typeof code === "string")) {
                     throw new Error("Accepted status codes are not all strings");
@@ -790,7 +799,8 @@ let needSetup = false;
                 await R.store(bean);
 
                 await updateMonitorNotification(bean.id, notificationIDList);
-                await saveDiagnosticChain(socket.userID, bean.id, monitor.diagnosticChain);
+                await saveDiagnosticChain(socket.userID, bean.id, diagnosticChain);
+                await saveHttpWorkflow(socket.userID, bean.id, httpWorkflow);
 
                 await server.sendUpdateMonitorIntoList(socket, bean.id);
 
@@ -973,6 +983,7 @@ let needSetup = false;
 
                 await updateMonitorNotification(bean.id, monitor.notificationIDList);
                 await saveDiagnosticChain(socket.userID, bean.id, monitor.diagnosticChain);
+                await saveHttpWorkflow(socket.userID, bean.id, monitor.httpWorkflow);
 
                 if (await Monitor.isActive(bean.id, bean.active)) {
                     await restartMonitor(socket.userID, bean.id);
@@ -1031,6 +1042,31 @@ let needSetup = false;
                 }
                 monitorJSON.latestDiagnosticResults = (await Diagnostic.getLatestResultsForMonitor(monitor.id)) || [];
 
+                // Attach HTTP workflow config + latest run so the edit form and
+                // details page can display them.
+                const httpWorkflowConfig = await HttpWorkflow.getWorkflowForMonitor(monitor.id);
+                if (httpWorkflowConfig) {
+                    monitorJSON.httpWorkflow = {
+                        enabled: httpWorkflowConfig.enabled,
+                        timeout: httpWorkflowConfig.timeout,
+                        steps: httpWorkflowConfig.steps.map((step) => ({
+                            name: step.name,
+                            method: step.method,
+                            url: step.url,
+                            headers: step.headers,
+                            queryParams: step.queryParams,
+                            body: step.body,
+                            timeout: step.timeout,
+                            assertions: step.assertions,
+                            extractions: step.extractions,
+                        })),
+                    };
+                    const latestRun = await HttpWorkflow.getLatestRunForMonitor(monitor.id);
+                    if (latestRun) {
+                        monitorJSON.latestWorkflowRun = latestRun;
+                    }
+                }
+
                 callback({
                     ok: true,
                     monitor: monitorJSON,
@@ -1075,6 +1111,52 @@ let needSetup = false;
                 }
 
                 await saveDiagnosticChain(socket.userID, monitorID, diagnosticChain);
+
+                callback({
+                    ok: true,
+                    msg: "Saved.",
+                    msgi18n: true,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("getWorkflowRuns", async (monitorID, callback) => {
+            try {
+                checkLogin(socket);
+
+                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found.");
+                }
+
+                const latestRun = await HttpWorkflow.getLatestRunForMonitor(monitorID);
+                callback({
+                    ok: true,
+                    run: latestRun,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("setHttpWorkflow", async (monitorID, httpWorkflow, callback) => {
+            try {
+                checkLogin(socket);
+
+                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found.");
+                }
+
+                await saveHttpWorkflow(socket.userID, monitorID, httpWorkflow);
 
                 callback({
                     ok: true,
@@ -1867,6 +1949,43 @@ async function saveDiagnosticChain(userID, monitorID, diagnosticChain) {
         validatedItems.map((item) => ({ monitor_id: item.monitor_id })),
         timeout
     );
+}
+
+/**
+ * Validate and persist the HTTP workflow of a monitor.
+ * If httpWorkflow is not provided, the existing workflow is left untouched.
+ * An empty steps array removes the workflow.
+ * @param {number} userID ID of the user owning the monitor
+ * @param {number} monitorID ID of the workflow monitor
+ * @param {{enabled?: boolean, timeout?: number, steps?: Array<object>}|undefined} httpWorkflow Workflow payload from the frontend
+ * @returns {Promise<void>}
+ * @throws Error if the workflow payload is invalid
+ */
+async function saveHttpWorkflow(userID, monitorID, httpWorkflow) {
+    if (!httpWorkflow) {
+        return;
+    }
+
+    // Verify ownership before writing.
+    const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, userID]);
+    if (!monitor) {
+        throw new Error("Monitor not found.");
+    }
+
+    const steps = Array.isArray(httpWorkflow.steps) ? httpWorkflow.steps : [];
+    const parsedTimeout = Number.parseInt(httpWorkflow.timeout, 10);
+    const timeout = Number.isNaN(parsedTimeout) ? 0 : Math.max(0, parsedTimeout);
+
+    if (steps.length === 0) {
+        await HttpWorkflow.deleteWorkflowForMonitor(monitorID);
+        return;
+    }
+
+    await HttpWorkflow.setWorkflowForMonitor(monitorID, {
+        enabled: httpWorkflow.enabled !== false,
+        timeout,
+        steps,
+    });
 }
 
 /**

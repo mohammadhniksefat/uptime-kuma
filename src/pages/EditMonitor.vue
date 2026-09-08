@@ -81,6 +81,7 @@
                                             {{ $t("Globalping - Access global monitoring probes") }}
                                         </option>
                                         <option value="grpc-keyword">gRPC(s) - {{ $t("Keyword") }}</option>
+                                        <option value="http-workflow">HTTP(s) - {{ $t("Multi-step Workflow") }}</option>
                                         <option value="json-query">HTTP(s) - {{ $t("Json Query") }}</option>
                                         <option value="kafka-producer">Kafka Producer</option>
                                         <option value="mqtt">MQTT</option>
@@ -1538,6 +1539,28 @@
                                 :condition-variables="conditionVariables"
                                 class="my-3"
                             />
+
+                            <!-- HTTP Workflow -->
+                            <template v-if="monitor.type === 'http-workflow'">
+                                <h2 class="mt-5 mb-2">{{ $t("HTTP Workflow") }}</h2>
+                                <p class="form-text">{{ $t("workflowDescription") }}</p>
+
+                                <div class="my-3">
+                                    <label for="workflowTimeout" class="form-label">{{
+                                        $t("Workflow timeout (seconds)")
+                                    }}</label>
+                                    <input
+                                        id="workflowTimeout"
+                                        v-model.number="monitor.httpWorkflow.timeout"
+                                        type="number"
+                                        min="0"
+                                        class="form-control"
+                                    />
+                                    <div class="form-text">{{ $t("workflowTimeoutDescription") }}</div>
+                                </div>
+
+                                <HttpWorkflowEditor v-model="monitor.httpWorkflow" />
+                            </template>
 
                             <!-- Interval -->
                             <div class="my-3">
@@ -3337,6 +3360,7 @@ import isFQDN from "validator/lib/isFQDN";
 import isIP from "validator/lib/isIP";
 import HiddenInput from "../components/HiddenInput.vue";
 import EditMonitorConditions from "../components/EditMonitorConditions.vue";
+import HttpWorkflowEditor from "../components/HttpWorkflowEditor.vue";
 
 const toast = useToast();
 
@@ -3415,6 +3439,11 @@ const monitorDefaults = {
     ntpStratumThreshold: 5,
     ntpTimeOffsetThreshold: 1000,
     ntpRootDispersionThreshold: 500,
+    httpWorkflow: {
+        enabled: true,
+        timeout: 0,
+        steps: [],
+    },
 };
 
 export default {
@@ -3431,6 +3460,7 @@ export default {
         TagsManager,
         VueMultiselect,
         EditMonitorConditions,
+        HttpWorkflowEditor,
     },
 
     data() {
@@ -3491,6 +3521,18 @@ export default {
             }
             if (this.monitor.system_service_name) {
                 return this.monitor.system_service_name;
+            }
+            if (this.monitor.type === "http-workflow") {
+                // Derive the friendly name from the first step URL.
+                const firstStep = this.monitor.httpWorkflow?.steps?.find((step) => step.url);
+                if (firstStep?.url) {
+                    try {
+                        const url = new URL(firstStep.url);
+                        return url.hostname;
+                    } catch (e) {
+                        // URL may contain {{variables}}, fall through to the default.
+                    }
+                }
             }
             if (this.monitor.url) {
                 if (this.monitor.url !== "http://" && this.monitor.url !== "https://") {
@@ -4180,6 +4222,28 @@ message HealthCheckResponse {
                             };
                         }
 
+                        if (!this.monitor.httpWorkflow) {
+                            this.monitor.httpWorkflow = {
+                                enabled: true,
+                                timeout: 0,
+                                steps: [],
+                            };
+                        }
+
+                        // Convert stored headers/query params objects into editable JSON text.
+                        for (const step of this.monitor.httpWorkflow.steps) {
+                            if (step.headersText === undefined) {
+                                step.headersText = step.headers && Object.keys(step.headers).length > 0
+                                    ? JSON.stringify(step.headers, null, 2)
+                                    : "";
+                            }
+                            if (step.queryParamsText === undefined) {
+                                step.queryParamsText = step.queryParams && Object.keys(step.queryParams).length > 0
+                                    ? JSON.stringify(step.queryParams, null, 2)
+                                    : "";
+                            }
+                        }
+
                         if (this.isClone) {
                             /*
                              * Cloning a monitor will include properties that can not be posted to backend
@@ -4281,6 +4345,33 @@ message HealthCheckResponse {
                 if (this.monitor.docker_host == null) {
                     toast.error(this.$t("DockerHostRequired"));
                     return false;
+                }
+            }
+
+            // Validate HTTP workflow steps
+            if (this.monitor.type === "http-workflow") {
+                const steps = this.monitor.httpWorkflow?.steps || [];
+                if (steps.length === 0) {
+                    toast.error(this.$t("workflowNoSteps"));
+                    return false;
+                }
+                for (let i = 0; i < steps.length; i++) {
+                    const step = steps[i];
+                    if (!step.url || !step.url.trim()) {
+                        toast.error(this.$t("workflowStepUrlRequired", [ i + 1 ]));
+                        return false;
+                    }
+                    try {
+                        if (step.headersText) {
+                            JSON.parse(step.headersText);
+                        }
+                        if (step.queryParamsText) {
+                            JSON.parse(step.queryParamsText);
+                        }
+                    } catch (err) {
+                        toast.error(this.$t("workflowStepJsonInvalid", { error: err.message }));
+                        return false;
+                    }
                 }
             }
 
@@ -4448,6 +4539,23 @@ message HealthCheckResponse {
 
             if (this.monitor.headers) {
                 this.monitor.headers = JSON.stringify(JSON.parse(this.monitor.headers), null, 4);
+            }
+
+            // Serialize HTTP workflow steps: convert JSON text fields into objects
+            // and strip the frontend-only text fields.
+            if (this.monitor.type === "http-workflow" && this.monitor.httpWorkflow) {
+                try {
+                    for (const step of this.monitor.httpWorkflow.steps) {
+                        step.headers = step.headersText ? JSON.parse(step.headersText) : {};
+                        step.queryParams = step.queryParamsText ? JSON.parse(step.queryParamsText) : {};
+                        delete step.headersText;
+                        delete step.queryParamsText;
+                    }
+                } catch (err) {
+                    toast.error(this.$t("workflowStepJsonInvalid", { error: err.message }));
+                    this.processing = false;
+                    return;
+                }
             }
 
             if (this.monitor.hostname) {

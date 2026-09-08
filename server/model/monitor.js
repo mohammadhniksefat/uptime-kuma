@@ -63,6 +63,7 @@ const { promisify } = require("node:util");
 const brotliCompress = promisify(zlib.brotliCompress);
 const DomainExpiry = require("./domain_expiry");
 const Diagnostic = require("./diagnostic");
+const HttpWorkflow = require("./http-workflow");
 
 const rootCertificates = rootCertificatesFingerprints();
 
@@ -2304,6 +2305,12 @@ class Monitor extends BeanModel {
                 throw new Error(`Invalid JSON in database query: ${error.message}`);
             }
         }
+
+        if (this.type === "http-workflow") {
+            if (this.url && this.url !== "http-workflow") {
+                // url is unused by workflow monitors; keep it neutral but non-empty
+            }
+        }
     }
 
     /**
@@ -2527,6 +2534,14 @@ class Monitor extends BeanModel {
             await Diagnostic.deleteChainForMonitor(monitorID);
         } catch (e) {
             log.debug("monitor", `Could not delete diagnostic chain for monitor #${monitorID}: ${e.message}`);
+        }
+
+        // Delete the HTTP workflow (if any) of this monitor, including its runs
+        // and step results, so workflows do not outlive their monitor.
+        try {
+            await HttpWorkflow.deleteWorkflowForMonitor(monitorID);
+        } catch (e) {
+            log.debug("monitor", `Could not delete HTTP workflow for monitor #${monitorID}: ${e.message}`);
         }
 
         // Delete from database

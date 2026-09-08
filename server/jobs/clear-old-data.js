@@ -48,6 +48,11 @@ const clearOldData = async () => {
             // stat_daily
             await R.exec("DELETE FROM stat_daily WHERE timestamp < ? ", [timestamp]);
 
+            // HTTP workflow runs (step results are removed via FK cascade)
+            await R.exec("DELETE FROM http_workflow_run WHERE started_at < " + sqlHourOffset, [
+                parsedPeriod * -24,
+            ]);
+
             if (Database.dbConfig.type === "sqlite") {
                 await R.exec("PRAGMA optimize;");
             }
